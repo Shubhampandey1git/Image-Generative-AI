@@ -1,0 +1,19 @@
+torch
+torchvision
+transformers
+datasets
+accelerate
+diffusers
+safetensors
+
+pillow
+tqdm
+requests
+
+# For GPU
+xformers
+
+gradio
+concurrent
+tqdm
+itertools
