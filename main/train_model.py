@@ -13,7 +13,9 @@ from diffusers import (
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTextModel, CLIPTokenizer
 import torch.multiprocessing as mp
-import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ========= CONFIG =========
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -22,13 +24,55 @@ LATENT_DIR = os.path.join(BASE_DIR, "data", "latents")
 CAPTION_FILE = os.path.join(BASE_DIR, "data", "captions.txt")
 OUTPUT_DIR = os.path.join(BASE_DIR, "models", "laion-mini")
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
-EPOCHS = 4
+EPOCHS = 2
 BATCH_SIZE = 1  # ✅ safer for RTX 3060 (6 GB)
-LEARNING_RATE = 5e-6
+LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_WORKERS = 4  # ✅ change to 2-4 after testing (Windows-safe)
+NUM_WORKERS = os.cpu_count() // 2  # ✅ change to 2-4 after testing (Windows-safe)
 
 # ==========================
+
+# ---------- Dataset Class ----------
+class LAIONDataset(torch.utils.data.Dataset):
+
+    def __init__(self, latent_dir, caption_file, tokenizer):
+
+        self.latent_dir = latent_dir
+
+        with open(caption_file, "r", encoding="utf-8") as f:
+            self.samples = [
+                tuple(line.strip().split("|",1))
+                for line in f if "|" in line
+            ]
+
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+
+        filename, caption = self.samples[idx]
+
+        latent_path = os.path.join(
+            self.latent_dir,
+            filename + ".pt"
+        )
+
+        latents = torch.load(latent_path, map_location="cpu").float()
+
+        tokens = self.tokenizer(
+            caption,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        )
+
+        return {
+            "latents": latents.squeeze(0),
+            "input_ids": tokens.input_ids.squeeze(0)
+        }
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -36,54 +80,14 @@ def main():
     print(f"💾 Model outputs will be saved to: {OUTPUT_DIR}")
     print(f"🚀 Training on: {DEVICE}")
 
-    # ---------- Dataset Class ----------
-
-    class LAIONDataset(torch.utils.data.Dataset):
-
-        def __init__(self, latent_dir, caption_file, tokenizer):
-
-            self.latent_dir = latent_dir
-
-            with open(caption_file, "r", encoding="utf-8") as f:
-                self.samples = [
-                    tuple(line.strip().split("|",1))
-                    for line in f if "|" in line
-                ]
-
-            self.tokenizer = tokenizer
-
-        def __len__(self):
-            return len(self.samples)
-
-        def __getitem__(self, idx):
-
-            filename, caption = self.samples[idx]
-
-            latent_path = os.path.join(
-                self.latent_dir,
-                filename + ".pt"
-            )
-
-            latents = torch.load(latent_path, map_location="cpu").float() # So that PyTorch doesn't try to load .pt file in GPU to CUDA
-
-            tokens = self.tokenizer(
-                caption,
-                padding="max_length",
-                truncation=True,
-                max_length=self.tokenizer.model_max_length,
-                return_tensors="pt",
-            )
-
-            return {
-                "latents": latents.squeeze(0),
-                "input_ids": tokens.input_ids.squeeze(0)
-            }
-
     # ---------- Load Pretrained Components ----------
     tokenizer = CLIPTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(MODEL_ID, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(MODEL_ID, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet")
+    
+    # ---------- Dataset Class Call ----------
+    dataset = LAIONDataset(LATENT_DIR, CAPTION_FILE, tokenizer)
     
     # Freezing components we dont want to train
     vae.requires_grad_(False)
@@ -91,9 +95,19 @@ def main():
     
     text_encoder.to(DEVICE, dtype=torch.float16)
     vae.to("cpu")
-    unet.to(DEVICE)
-    unet.to(memory_format=torch.channels_last)
-    
+    unet.to(DEVICE, dtype=torch.float16)
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        lora_dropout=0.1,
+        bias="none",
+    )
+
+    unet = get_peft_model(unet, lora_config)
+
+    unet.print_trainable_parameters()
+        
     # Enable memory optimization
     unet.enable_xformers_memory_efficient_attention()
     unet.enable_gradient_checkpointing()
@@ -108,7 +122,10 @@ def main():
     # ---------- Optimizer and Scheduler ----------
     # ⚠️ If this crashes on Windows (it sometimes does), switch to:
     # optimizer = torch.optim.AdamW(unet.parameters(), lr=LEARNING_RATE)
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, unet.parameters()),
+        lr=LEARNING_RATE
+    )
     num_training_steps = len(dataloader) * EPOCHS
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer, 0, num_training_steps)
     
@@ -119,7 +136,6 @@ def main():
     noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
 
     print("\n🚀 Starting training...")
-    scaler = torch.cuda.amp.GradScaler()  # ✅ mixed precision
 
     for epoch in range(EPOCHS):
         unet.train()
@@ -149,14 +165,13 @@ def main():
                 loss = torch.nn.functional.mse_loss(model_pred, noise)
 
             optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward()
+            optimizer.step()
             lr_scheduler.step()
 
             progress.set_postfix({"loss": float(loss.item())})
 
-        unet.save_pretrained(os.path.join(OUTPUT_DIR, f"epoch_{epoch+1}"))
+        unet.save_pretrained(os.path.join(OUTPUT_DIR, f"epoch_{epoch+1}_lora"))
         print(f"💾 Saved checkpoint for epoch {epoch+1}")
 
     print("✅ Training complete!")
