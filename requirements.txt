@@ -9,6 +9,7 @@ safetensors
 pillow
 tqdm
 requests
+bitsandbytes
 
 # For GPU
 xformers
