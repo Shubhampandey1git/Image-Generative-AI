@@ -1,38 +1,65 @@
 # app.py
 import gradio as gr
-from diffusers import StableDiffusionPipeline
 import torch
+from diffusers import StableDiffusionPipeline
+from peft import PeftModel
+import time
+import os
 
-# Load your Stable Diffusion model
-# You can later replace this with your fine-tuned LoRA model path
-model_id = "runwayml/stable-diffusion-v1-5"
+# ========= CONFIG =========
+MODEL_ID = "runwayml/stable-diffusion-v1-5"
+LORA_PATH = "../models/laion-mini/epoch_2_lora"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-print("Loading model...")
+print("🚀 Loading base model...")
 pipe = StableDiffusionPipeline.from_pretrained(
-    model_id,
-    torch_dtype=torch.float16
-).to("cuda")
+    MODEL_ID,
+    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
+).to(DEVICE)
 
-# Define generation function
-def generate(prompt, steps, scale):
+# Speed optimizations
+pipe.enable_attention_slicing()
+pipe.enable_vae_slicing()
+pipe.enable_model_cpu_offload()
+
+print("🔗 Loading LoRA...")
+pipe.unet = PeftModel.from_pretrained(pipe.unet, LORA_PATH)
+
+print("✅ Model ready!")
+
+# ---------- Generation Function ----------
+def generate(prompt, steps, scale, negative_prompt, size, seed):
+    gr.Slider(256, 768, value=512, step=64, label="Image Size")
+    
     image = pipe(
-        prompt,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
         num_inference_steps=int(steps),
-        guidance_scale=float(scale)
+        guidance_scale=float(scale),
+        height=size,
+        width=size
     ).images[0]
+    
+    os.makedirs("outputs", exist_ok=True)
+    
+    filename = f"outputs/{int(time.time())}.png"
+    image.save(filename)
     return image
 
-# Create Gradio interface
+# ---------- Gradio UI ----------
 interface = gr.Interface(
     fn=generate,
     inputs=[
-        gr.Textbox(label="Enter your prompt:", placeholder="A futuristic city under pink skies"),
+        gr.Textbox(label="Prompt", placeholder="A futuristic city under pink skies"),
         gr.Slider(10, 50, value=25, step=1, label="Inference Steps"),
-        gr.Slider(1, 15, value=7.5, step=0.5, label="Guidance Scale")
+        gr.Slider(1, 15, value=7.5, step=0.5, label="Guidance Scale"),
+        gr.Textbox(label="Negative Prompt", value="blurry, low quality"),
+        gr.Slider(256, 768, value=512, step=64, label="Image Size"),
+        gr.Number(label="Seed", value=42)
     ],
     outputs="image",
-    title="🎨 Image Generative AI",
-    description="Generate images using Stable Diffusion on your RTX 3060 GPU."
+    title="🎨 Your Custom Stable Diffusion (LoRA)",
+    description="Generate images using your trained LoRA model 🚀"
 )
 
 if __name__ == "__main__":
