@@ -17,3 +17,7 @@ gradio
 concurrent
 tqdm
 itertools
+
+# ---- api ----
+fastapi
+uvicorn
