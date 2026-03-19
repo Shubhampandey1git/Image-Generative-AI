@@ -23,17 +23,48 @@ import retrofit2.Response
 
 class MainActivity : ComponentActivity() {
 
+    fun saveImageToGallery(bitmap: android.graphics.Bitmap) {
+        val filename = "AI_Image_${System.currentTimeMillis()}.png"
+
+        val resolver = contentResolver
+        val contentValues = android.content.ContentValues().apply {
+            put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "image/png")
+            put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/AIImages")
+        }
+
+        val imageUri = resolver.insert(
+            android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            contentValues
+        )
+
+        imageUri?.let { uri ->
+            val outputStream = resolver.openOutputStream(uri)
+            outputStream?.use {
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         setContent {
-            AppUI()
+            var imageBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+            var loading by remember { mutableStateOf(false) }
+            AppUI { bitmap ->
+                saveImageToGallery(bitmap)
+            }
         }
     }
+
 }
 
+
+
 @Composable
-fun AppUI() {
+fun AppUI(onSave: (Bitmap) -> Unit) {
+    var saved by remember { mutableStateOf(false) }
     var prompt by remember { mutableStateOf("") }
     var imageBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var loading by remember { mutableStateOf(false) }
@@ -72,9 +103,31 @@ fun AppUI() {
         imageBitmap?.let {
             Image(
                 bitmap = it.asImageBitmap(),
-                contentDescription = null,
-                modifier = Modifier.fillMaxWidth()
+                contentDescription = "Generated Image",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(300.dp)
             )
+        }
+
+        imageBitmap?.let {
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Button(
+                onClick = {
+                    onSave(it)  // save when user clicks
+                    saved = true
+                          },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Saved to Gallery")
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+            if (saved) {
+                Text("Saved to Gallery")
+            }
+
         }
     }
 }

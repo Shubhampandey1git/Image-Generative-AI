@@ -10,7 +10,7 @@ app = FastAPI()
 
 # ========= CONFIG =========
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
-LORA_PATH = "../models/laion-mini/epoch_2_lora"
+LORA_PATH = r"E:\AI ML\AI Image Generation\models\laion-mini\epoch_2_lora"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load model once
