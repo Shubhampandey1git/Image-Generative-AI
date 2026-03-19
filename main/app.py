@@ -8,7 +8,7 @@ import os
 
 # ========= CONFIG =========
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
-LORA_PATH = "../models/laion-mini/epoch_2_lora"
+LORA_PATH = LORA_PATH = r"E:\AI ML\AI Image Generation\models\laion-mini\epoch_2_lora"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print("🚀 Loading base model...")
@@ -18,9 +18,9 @@ pipe = StableDiffusionPipeline.from_pretrained(
 ).to(DEVICE)
 
 # Speed optimizations
+pipe.to("cuda")
 pipe.enable_attention_slicing()
 pipe.enable_vae_slicing()
-pipe.enable_model_cpu_offload()
 
 print("🔗 Loading LoRA...")
 pipe.unet = PeftModel.from_pretrained(pipe.unet, LORA_PATH)
