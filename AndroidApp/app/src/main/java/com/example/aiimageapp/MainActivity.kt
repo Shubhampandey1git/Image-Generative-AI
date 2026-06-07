@@ -85,7 +85,9 @@ fun AppUI(onSave: (Bitmap) -> Unit) {
                 println("BUTTON CLICKED")
                 loading = true
                 generateImage(prompt) {
-                    imageBitmap = it
+                    if (it != null) {
+                        imageBitmap = it
+                    }
                     loading = false
                 }
             },

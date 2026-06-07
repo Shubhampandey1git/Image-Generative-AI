@@ -1,193 +1,170 @@
+# app.py
+
 import os
+import time
 import torch
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from PIL import Image
-from tqdm import tqdm
-from diffusers import (
-    StableDiffusionPipeline,
-    DDPMScheduler,
-    UNet2DConditionModel,
-    AutoencoderKL,
-)
-from diffusers.optimization import get_cosine_schedule_with_warmup
-from transformers import CLIPTextModel, CLIPTokenizer
-import torch.multiprocessing as mp
-from peft import LoraConfig, get_peft_model
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import gradio as gr
 
-# ========= CONFIG =========
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from diffusers import StableDiffusionPipeline
+from peft import PeftModel
 
-LATENT_DIR = os.path.join(BASE_DIR, "data", "latents")
-CAPTION_FILE = os.path.join(BASE_DIR, "data", "captions.txt")
-OUTPUT_DIR = os.path.join(BASE_DIR, "models", "laion-mini")
-MODEL_ID = "runwayml/stable-diffusion-v1-5"
-EPOCHS = 2
-BATCH_SIZE = 1  # ✅ safer for RTX 3060 (6 GB)
-LEARNING_RATE = 1e-4
+# ================= CONFIG =================
+
+BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+
+LORA_PATH = r"E:\AI ML\AI Image Generation\models\laion-mini\epoch_2_lora"
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-NUM_WORKERS = os.cpu_count() // 2  # ✅ change to 2-4 after testing (Windows-safe)
 
-# ==========================
+# ==========================================
 
-# ---------- Dataset Class ----------
-class LAIONDataset(torch.utils.data.Dataset):
+print("🚀 Loading Stable Diffusion...")
 
-    def __init__(self, latent_dir, caption_file, tokenizer):
+pipe = StableDiffusionPipeline.from_pretrained(
+    BASE_MODEL,
+    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+    safety_checker=None,
+    requires_safety_checker=False,
+    load_safety_checker=False
+)
 
-        self.latent_dir = latent_dir
+print("🔗 Loading LoRA weights...")
 
-        with open(caption_file, "r", encoding="utf-8") as f:
-            self.samples = [
-                tuple(line.strip().split("|",1))
-                for line in f if "|" in line
-            ]
+pipe.unet = PeftModel.from_pretrained(
+    pipe.unet,
+    LORA_PATH
+)
 
-        self.tokenizer = tokenizer
+pipe = pipe.to(DEVICE)
 
-    def __len__(self):
-        return len(self.samples)
+# ---------- Optimizations ----------
 
-    def __getitem__(self, idx):
+pipe.enable_attention_slicing()
+pipe.enable_vae_slicing()
 
-        filename, caption = self.samples[idx]
+if DEVICE == "cuda":
+    pipe.enable_xformers_memory_efficient_attention()
 
-        latent_path = os.path.join(
-            self.latent_dir,
-            filename + ".pt"
-        )
+print("✅ Model Ready!")
 
-        latents = torch.load(latent_path, map_location="cpu").float()
+# ==========================================
+# IMAGE GENERATION
+# ==========================================
 
-        tokens = self.tokenizer(
-            caption,
-            padding="max_length",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        )
+def generate_image(
+    prompt,
+    negative_prompt,
+    steps,
+    guidance,
+    size,
+    seed
+):
 
-        return {
-            "latents": latents.squeeze(0),
-            "input_ids": tokens.input_ids.squeeze(0)
-        }
+    if seed == -1:
+        seed = torch.randint(0, 999999, (1,)).item()
 
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"📁 Using data from: {LATENT_DIR}")
-    print(f"💾 Model outputs will be saved to: {OUTPUT_DIR}")
-    print(f"🚀 Training on: {DEVICE}")
+    generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
 
-    # ---------- Load Pretrained Components ----------
-    tokenizer = CLIPTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(MODEL_ID, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(MODEL_ID, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet")
-    
-    # ---------- Dataset Class Call ----------
-    dataset = LAIONDataset(LATENT_DIR, CAPTION_FILE, tokenizer)
-    
-    # Freezing components we dont want to train
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    
-    text_encoder.to(DEVICE, dtype=torch.float16)
-    vae.to("cpu")
-    unet.to(DEVICE, dtype=torch.float16)
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-        lora_dropout=0.1,
-        bias="none",
-    )
+    image = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        num_inference_steps=int(steps),
+        guidance_scale=float(guidance),
+        height=int(size),
+        width=int(size),
+        generator=generator
+    ).images[0]
 
-    unet = get_peft_model(unet, lora_config)
+    os.makedirs("outputs", exist_ok=True)
 
-    unet.print_trainable_parameters()
-        
-    # Enable memory optimization
-    unet.enable_xformers_memory_efficient_attention()
-    unet.enable_gradient_checkpointing()
-    unet.set_attention_slice("max")
+    filename = f"outputs/{int(time.time())}.png"
 
-    # ---------- Create Dataloader ----------
-    dataset = LAIONDataset(LATENT_DIR, CAPTION_FILE, tokenizer)
-    dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=False
-    )
+    image.save(filename)
 
-    # ---------- Optimizer and Scheduler ----------
-    # ⚠️ If this crashes on Windows (it sometimes does), switch to:
-    # optimizer = torch.optim.AdamW(unet.parameters(), lr=LEARNING_RATE)
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, unet.parameters()),
-        lr=LEARNING_RATE
-    )
-    num_training_steps = len(dataloader) * EPOCHS
-    lr_scheduler = get_cosine_schedule_with_warmup(optimizer, 0, num_training_steps)
-    
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-    # ---------- Training Loop ----------
-    noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+    return image, filename
 
-    print("\n🚀 Starting training...")
 
-    for epoch in range(EPOCHS):
-        unet.train()
-        progress = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="batch")
+# ==========================================
+# GRADIO UI
+# ==========================================
 
-        for batch in progress:
-            latents = batch["latents"].to(
-                DEVICE,
-                dtype=torch.float16
+with gr.Blocks() as demo:
+
+    gr.Markdown("# 🎨 AI Image Generator")
+    gr.Markdown("Stable Diffusion + Your Custom LoRA")
+
+    with gr.Row():
+
+        with gr.Column():
+
+            prompt = gr.Textbox(
+                label="Prompt",
+                placeholder="A futuristic cyberpunk city at night"
             )
-            input_ids = batch["input_ids"].to(DEVICE)
 
-            noise = torch.randn_like(latents, dtype=torch.float16)
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (latents.shape[0],),
-                device=DEVICE
-            ).long()
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            negative_prompt = gr.Textbox(
+                label="Negative Prompt",
+                value="blurry, low quality, distorted"
+            )
 
-            with torch.no_grad():
-                encoder_hidden_states = text_encoder(input_ids).last_hidden_state
+            steps = gr.Slider(
+                minimum=10,
+                maximum=50,
+                value=25,
+                step=1,
+                label="Inference Steps"
+            )
 
-            with torch.cuda.amp.autocast():
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                loss = torch.nn.functional.mse_loss(model_pred, noise)
+            guidance = gr.Slider(
+                minimum=1,
+                maximum=15,
+                value=7.5,
+                step=0.5,
+                label="Guidance Scale"
+            )
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            lr_scheduler.step()
+            size = gr.Slider(
+                minimum=256,
+                maximum=768,
+                value=512,
+                step=64,
+                label="Image Size"
+            )
 
-            progress.set_postfix({"loss": float(loss.item())})
+            seed = gr.Number(
+                value=-1,
+                label="Seed (-1 = Random)"
+            )
 
-        unet.save_pretrained(os.path.join(OUTPUT_DIR, f"epoch_{epoch+1}_lora"))
-        print(f"💾 Saved checkpoint for epoch {epoch+1}")
+            generate_btn = gr.Button("Generate Image")
 
-    print("✅ Training complete!")
+        with gr.Column():
 
-    # ---------- Save the full pipeline ----------
-    pipe = StableDiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        text_encoder=text_encoder,
-        vae=vae,
-        unet=unet,
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
+            output_image = gr.Image(label="Generated Image")
+
+            output_file = gr.Textbox(label="Saved File")
+
+    generate_btn.click(
+        fn=generate_image,
+        inputs=[
+            prompt,
+            negative_prompt,
+            steps,
+            guidance,
+            size,
+            seed
+        ],
+        outputs=[
+            output_image,
+            output_file
+        ]
     )
-    pipe.save_pretrained(OUTPUT_DIR)
-    print(f"🎉 Model saved to {OUTPUT_DIR}")
 
+# ==========================================
 
 if __name__ == "__main__":
-    mp.freeze_support()  # Windows multiprocessing fix
-    main()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )
